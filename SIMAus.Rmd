@@ -1,0 +1,1121 @@
+---
+title: "Modelling Population Flows Using Spatial Interaction Models"
+author: "Adam Dennett"
+date: "22 March 2018"
+output:
+  html_document:
+    df_print: paged
+always_allow_html: yes
+---
+
+## Getting Started: Setting up R and Getting Your Data in Order
+
+I will assume that you already have R and RStudio installed on your computer and you already have a little bit of knowledge about both. If you don't, then download R, and then RStudio from https://www.r-project.org/ and https://www.rstudio.com/. They are both cross-platform and free to download. 
+
+Open up R Studio and set up a new project working directory. Open a new R script and save it into your new working directory. 
+
+Check the file is in your working directory and R can see it...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+getwd()
+list.files(getwd())
+```
+
+Before we go any further, let's first get a few packages that will come in handy for wrangling our data, carrying out some analysis and producing some visualisations. 
+
+If you don't have the packages already, install them using this script:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+
+install.packages(c("sf", "tidyverse", "tmap", "geojsonio", "sp", "reshape2", "stplanr", "leaflet", "broom"))
+
+setwd("E:\\Users\\Adam\\Dropbox\\Lectures\\SpatialInteractionModelling\\SIModelling")
+
+```
+
+
+Now 'library' them into your working environment:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(tmap)
+library(geojsonio)
+library(sp)
+library(reshape2)
+library(stplanr)
+library(leaflet)
+library(broom)
+```
+
+**Check that all of these packages have been libraried successfully and you don't get any error messages - if they haven't libraried successfully, then we may run into some problems later on. Possible problems that I have seen already are**
+
+**1. that rgdal can cause some problems on Macs - if this happens, try updating your version of R and RStudio and re-installing the packages. If you are still having problems, try these solutions suggested on Stack Overflow, [here](http://stackoverflow.com/questions/34333624/trouble-installing-rgdal): **
+
+**2. If you are using a computer that uses chinese characters in the file system, you might need to download the zipfile of the package and install it into your package directory manually.**
+
+
+###Setting up Some Spatial Data
+
+As the name suggests, to run a spatial interaction model, you are going to need some spatial data and some data on interactions (flows). Let's start with some spatial data:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#here is a geojson of Greater Capital City Statistical Areas, so let's read it in as an 'sp' object
+Aus <- geojson_read("https://www.dropbox.com/s/0fg80nzcxcsybii/GCCSA_2016_AUST_New.geojson?raw=1", what = "sp")
+
+#now let's extract the data
+Ausdata <- Aus@data
+
+#here is a geojson of Greater Capital City Statistical Areas, so let's read it in as a 'simple features' object and set the coordinate reference system at the same time in case the file doesn't have one.
+AusSF <- st_as_sf(Aus) %>% st_set_crs(4283) 
+#view the file
+AusSF
+#now you may have noticed that the code order is a bit weird, so let's fix that and reorder
+AusSF1 <- AusSF[order(AusSF$GCCSA_CODE),]
+#now let's create an 'sp' object from our new ordered SF object
+Aus <- as(AusSF1, "Spatial")
+
+```
+
+Check your boundaries have downloaded OK...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+tmap_mode("plot")
+qtm(AusSF)
+#and have a quick look at the top of the data file
+
+```
+
+
+###Calculating a distance matrix
+
+In our spatial interaction model, space is one of the key predictor variables. In this example we will use a very simple Euclidean distance measure between the centroids of the Greater Capital City Statistical Areas as our measure of space. 
+
+Now, with some areas so huge, there are obvious potential issues with this (for example we could use the average distance to larger settlements in the noncity areas), however as this is just an example, we will proceed with a simple solution for now. 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#use the spDists function to create a distance matrix
+#first re-project into a projected (metres) coordinate system
+AusProj <- spTransform(Aus,"+init=epsg:3112")
+summary(AusProj)
+#now calculate the distances
+dist <- spDists(AusProj)
+dist 
+
+#melt this matrix into a list of origin/destination pairs using melt. Melt in in the reshape2 package. Reshape2, dplyr and ggplot, together, are some of the best packages in R, so if you are not familiar with them, get googling and your life will be much better!
+distPair <- melt(dist)
+#convert metres into km
+distPair$value <- distPair$value / 1000
+head(distPair)
+```
+
+These distances are notionally in km - although you may notice that they are not 100% accurate. This is not a big problem for now as this is just an example, but for real applications, more accurate distances may be used. 
+
+## Flow Data
+
+The data we are going to use to test our spatial interaction models with is migration data from the 2011 Australian Census. The Australian Census has usual address indicator on Census night (UAICP) and address one year ago and 5 years ago indicators. From these, one year and 5 year migration transitions can be recorded - here we will use the 5 year transitions. 
+
+As well as flow data, there are additional data on unemployment rates, weekly income and the percentage of people living in rented accommodation for each origin and destination. We will use these as destination attractiveness / mass term and origin emissiveness / mass term proxies in the models which follow.
+
+These data can be read straight into R with the following command:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#read in your Australian Migration Data
+mdata <- read_csv("https://www.dropbox.com/s/wi3zxlq5pff1yda/AusMig2011.csv?raw=1",col_names = TRUE)
+
+head(mdata)
+```
+
+Now to finish, we need to add in our distance data that we generated earlier and create a new column of total flows which excludes flows that occur within areas (we could keep the within-area (intra-area) flows in, but they can cause problems so for now we will just exclude them).
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#First create a new total column which excludes intra-zone flow totals (well sets them to a very very small number for reasons you will see later...)
+mdata$FlowNoIntra <- ifelse(mdata$Orig_code == mdata$Dest_code,0,mdata$Flow)
+mdata$offset <- ifelse(mdata$Orig_code == mdata$Dest_code,0.0000000001,1)
+
+#now we ordered our spatial data earlier so that our zones are in their code order. We can now easily join these data together with our flow data as they are in the correct order.
+mdata$dist <- distPair$value 
+#and while we are here, rather than setting the intra zonal distances to 0, we should set them to something small (most intrazonal moves won't occur over 0 distance)
+mdata$dist <- ifelse(mdata$dist == 0,5,mdata$dist)
+
+```
+
+Let's have a quick look at what your spangly new data looks like:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+head(mdata)
+```
+
+
+And this is what those flows look like on a map - quick and dirty style... Although first we'll remove the intra-zonal flows.
+
+```{r}
+#remove intra-zonal flows
+mdatasub <- mdata[mdata$Orig_code!=mdata$Dest_code,]
+```
+
+Now create a flow-line object and weight the lines according to the flow volumes...
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#use the od2line function from RObin Lovelace's excellent stplanr package - remove all but the origin, destination and flow columns
+mdatasub_skinny <- mdatasub[,c(2,4,5)]
+travel_network <- od2line(flow = mdatasub_skinny, zones = Aus)
+#convert the flows to WGS84
+travel_networkwgs <- spTransform(travel_network,"+init=epsg:4326" )
+#And the Australia Map
+AusWGS <- spTransform(Aus,"+init=epsg:4326" )
+#and set the line widths to some sensible value according to the flow
+w <- mdatasub_skinny$Flow / max(mdatasub_skinny$Flow) * 10
+#now plot it...
+plot(travel_networkwgs, lwd = w)
+plot(AusWGS, add=T)
+```
+
+Or, if you want to be really cool - on a leaflet map...
+
+```{r}
+#plot in leaflet
+leaflet() %>% 
+  addTiles() %>% 
+  addPolylines(
+  data = travel_networkwgs,
+  weight = w)
+```
+
+
+Or you can view your flows as a matrix...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#now we can create pivot table to turn paired list into matrix (and compute the margins as well)
+mdatasubmat <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "Flow", margins=c("Orig_code", "Dest_code"))
+mdatasubmat
+```
+
+OK, we've set everything up, now it's...
+
+##Modellin' Time!
+
+In explaining how to run and calibrate spatial interaction models in R, I will adopt the notation used by Taylor Oshan in his excellent primer for running spatial interation models in Python. The paper is well worth a read and can be found here: http://openjournals.wu.ac.at/region/paper_175/175.html 
+
+Below is the classic multiplicative gravity model:
+
+(1)
+$$T_{ij} = k \frac{V_i^\mu W_j^\alpha}{d_{ij}^\beta}$$
+
+This gravity model can be written in the form more familiar from Wilson's 1971 paper - http://journals.sagepub.com/doi/abs/10.1068/a030001 
+
+(2)
+$$T_{ij} = k  V_i^\mu  W_j^\alpha d_{ij}^-\beta $$
+
+**This model just says that the flows between an origin and destination are proportional to the product of the mass of the origin and destination and inversely proportional to the distance between them. **
+
+**As origin and destination masses increase, flows increase, but as distance increases, flows decrease, and *vice versa*. **
+
+* where $T_{ij}$ is the transition or flow, $T$, between origin $i$ (always the rows in a matrix) and destination $j$ (always the columns in a matrix). If you are not overly familiar with matrix notation, the $i$ and $j$ are just generic indexes to allow us to refer to any cell in the matrix more generally.
+
+* $V$ is a vector (a 1 dimensional matrix - or, if you like, a single line of numbers) of origin attributes which relate to the emissiveness of all origins in the dataset, $i$ - in our sample dataset, we have a vector of origin populations (which I have called vi1_origpop) and a vector of origin average salaries (which I have called vi2_origsal) in 2001
+
+* $W$ is a vector of desination of attributes relating to the attractivenss of all destinations in the dataset, $j$ - in our sample dataset, we have a vector of destination populations (which I have called wj1_destpop) and a vector of destination average salaries (which I have called wj2_destsal) in 2001
+
+* $d$ is a matrix of costs relating to the flows between $i$ and $j$ - in our case the cost is distance and it is called 'dist' in our dataset.
+
+* $k$, $\mu$, $\alpha$ and $\beta$ are all model parameters to be estimated
+
+$k$ is a constant of proportionality and leads to this particular model being more accurately described as a 'total constrained' model as all flows estimated by the model will sum to any observed flow data used to calibrate the parameters, where:
+
+(3)
+$$k = \frac{T}{\sum_i \sum_jV_i^\mu  W_j^\alpha d_{ij}^-\beta }$$
+
+and $T$ is the sum of our matrix of observed flows or:
+
+(4)
+$$T = \sum_i \sum_j T_{ij}$$
+
+In plain language, this is just the sum of all observed flows divided by the sum of all of the other elements in the model. 
+
+###Estimating Model Parameters
+
+Now, it's perfectly possible to produce some flow estimates by plugging some arbitrary or expected estimated values into our parameters. The parameters relate to the scaling effect / importance of the variables they are associated with. Most simply, where the effects of origin and destination attributes on flows scale in a linear fashion (i.e. for a 1 unit increase in, say, population at origin, we might expect a 1 unit increase in flows of people from that origin, or for a halving in average salary at destination, we might expect a halving of commuters), $\mu$ = 1 and $\alpha$ = 1. In Newton's original gravity equation, $\beta$ = -2 where the influence of distance on flows follows a power law - i.e. for a 1 unit increase in distance, we have a 1^-2 (1) unit decrease in flows, for a 2 unit increase in distance, we have 2^-2 (0.25 or 1/4) of the flows, for a 3 unit increase, 3^-2 (0.111) etc. 
+
+Let's see if these parameters are a fair first guess 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#First plot the commuter flows against distance and then fit a model line with a ^-2 parameter
+plot1 <- qplot(mdata$dist, mdata$Flow)
+#and now the model fit...
+options(scipen=10000)
+plot1 + 
+  stat_function(fun=function(x)x^-2, geom="line", aes(colour="^-2")) +
+  labs(x = "Distance", y = "Migration Flow") +
+  theme(legend.position="none")
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+plot2 <- qplot(mdata$vi1_origpop, mdata$Flow)
+plot2 + 
+  stat_function(fun=function(x)x^1, geom="line", aes(colour="^1")) + 
+  labs(x = "Origin Population", y = "Migration Flow") +
+  theme(legend.position="none")
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+plot3 <- qplot(mdata$wj3_destmedinc, mdata$Flow)
+plot3 + 
+  stat_function(fun=function(x)x^1, geom="line", aes(colour="^1")) +
+  labs(x = "Destination Median Income", y = "Migration Flow") +
+  theme(legend.position="none")
+```
+
+OK, so it looks like we're not far off (well, destination income doesn't look too promising as a predictor, but we'll see how we get on...), so let's see what flow estimates with these starting parameters look like.
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#set up some variables to hold our parameter values in:
+mu <- 1
+alpha <- 1
+beta <- -2
+k <- 1
+T2 <- sum(mdatasub$Flow)
+```
+
+Now let's create some flow estimates using Equation 2 above... Begin by applying the parameters to the variables:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+vi1_mu <- mdatasub$vi1_origpop^mu
+wj3_alpha <- mdatasub$wj3_destmedinc^alpha
+dist_beta <- mdatasub$dist^beta
+T1 <- vi1_mu*wj3_alpha*dist_beta
+k <- T2/sum(T1)
+```
+
+Then, just as in Equation 2 above, just multiply everything together to get your flow estimates:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run the model and store all of the new flow estimates in a new column in the dataframe
+mdatasub$unconstrainedEst1 <- round(k*vi1_mu*wj3_alpha*dist_beta,0)
+#check that the sum of these estimates makes sense
+sum(mdatasub$unconstrainedEst1)
+#turn it into a little matrix and have a look at your handy work
+mdatasubmat1 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "unconstrainedEst1", margins=c("Orig_code", "Dest_code"))
+mdatasubmat1
+```
+
+How do the flow estimates compare with the original flows?
+
+```{r}
+mdatasubmat
+```
+
+
+##How good is my model?
+
+So, looking at the two little matrices above you can see that in some cases the flow estimates aren't too bad, but in others they are pretty rubbish. Whilst it's OK to eyeball small flow matrices like this, when you have much larger matrices, we need another solution...
+
+###Testing the "goodness-of-fit". 
+
+Yes, that's what it's called - I know, it doesn't sound correct, but goodness-of-fit is the correct term for checking how well your model estimates match up with your observed flows. 
+
+So how do we do it? 
+
+Well... there are a number of ways but perhaps the two most common are to look at the coefficient of determination ($r^2$) or the Square Root of Mean Squared Error (RMSE). You've probably come across $r^2$ before if you have fitted a linear regression model, but you may not have come across RMSE. There are other methods and they all do more or less the same thing, which is essentially to compare the modelled estimates with the real data. $r^2$ is popular as it is quite intuitive and can be compared across models. RMSE is less intuitive, but some argue is better for comparing changes to the same model. Here's we'll do both...
+
+#### R-Squared
+
+$r^2$ is the square of the correlation coefficient, $r$
+
+For our sample data, we can calculate this very easily using a little function
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRSquared <- function(observed,estimated){
+  r <- cor(observed,estimated)
+  R2 <- r^2
+  R2
+}
+CalcRSquared(mdatasub$Flow,mdatasub$unconstrainedEst1)
+```
+
+Using this function we get a value of 0.18 or around 18%. This tells us that our model accounts for about 18% of the variation of flows in the system. Not bad, but not brilliant either. 
+
+#### Root Mean Squared Error (RMSE)
+
+We can use a similar simple function to calculate the RMSE for our data
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRMSE <- function(observed,estimated){
+  res <- (observed - estimated)^2
+  RMSE <- round(sqrt(mean(res)),3)
+  RMSE
+}
+CalcRMSE(mdatasub$Flow,mdatasub$unconstrainedEst1)
+```
+
+The figure that is produced by the RMSE calculation is far less intuitive than the $r^2$ value and this is mainly because it very much depends on things like the units the data are in and the volume of data. It can't be used to compare different models run using different data sets. However, it is good for assessing whether changes to the model result in improvements. The closer to 0 the RMSE value, the better the model. 
+
+So how can we start to improve our fit...?
+
+
+##Improving our model: 1 - Calibrating parameters 
+###(this bit might take a little while, but stick with it)
+
+Now, the model we have run above is probably the most simple spatial interaction model we could have run and the results aren't terrible, but they're not great either. 
+
+One way that we can improve the fit of the model is by calibrating the parameters on the flow data that we have. 
+
+The traditional way that this has been done computationally is by using the goodness-of-fit statistics. If you have the requisite programming skills, you can write a computer algorithm that iteratively adjusts each parameter, runs the model, checks the goodness-of-fit and then starts all over again until the goodness-of-fit statistic is maximised. 
+
+This is partly why spatial interaction modelling was the preserve of specialists for so long as acquiring the requisite skills to write such computer programmes can be challenging! 
+
+However, since the early days of spatial interaction modelling, a number of useful developments have occurred... For a more detailed explanation, read the accompanying paper, but I will skate over them again here.
+
+The mathematically minded among you may have noticed that if you take the logarithms of both sides of Equation 2, you end up with the following equation:
+
+(5)
+$$\ln T_{ij} = k + \mu\ln V_i + \alpha\ln W_j - \beta \ln d_{ij}$$
+
+Those of you who have played around with regression models in the past will realise that this is exactly that - a regression model. 
+
+And if you have played around with regression models you will be aware that there are various pieces of software available to run regressions (such as R) and calibrate the parameters for us, so we don't have to be expert programmers to do this - yay!
+
+Now, there are a couple of papers that are worth reading at this point. Perhaps the best is by Flowerdew and Aitkin (1982), titled "A METHOD OF FITTING THE GRAVITY MODEL BASED ON THE POISSON DISTRIBUTION" - the paper can be found here: http://onlinelibrary.wiley.com/doi/10.1111/j.1467-9787.1982.tb00744.x/abstract 
+
+One of the key points that Flowerdew and Aitkin make is that the model in Equation 5 (known as a log-normal model) has various problems associated with it which mean that the estimates produced might not be reliable. If you'd like to know more about these, read the paper (and also Wilson's 1971 paper), but at this point it is worth just knowing that the way around many of these issues is to re-specify the model, not as a log-normal regression, but as a Poisson or negative binomial regression model.
+
+###Poisson regression
+
+Again, I go into this in more detail in the accompanying paper, but the main theory (for non-experts like me anyway) behind the Poisson regression model is that the sorts of flows that spatial interaction models deal with (such as migration or commuting flows) relate to non-negative integer counts (you can't have negative people moving between places and you can't - normally, if they are alive - have fractions of people moving either). 
+
+As such, the continuous (normal) probabilty distributions which underpin standard regression models don't hold. However, the discrtete probability distributions such as the Poisson distribution and the negative binomial distribution (of which the Poisson distribution is a special case - wikipedia it) do hold and so we can use these associations to model our flows. 
+
+At this point, it's probably worth you looking at what a Poisson disribution looks like compared to a normal distribution, if you are not familiar.
+
+Here's a normal distribution:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#histogram with a count of 3000, a mean of 75 and a standard deviation of 5
+qplot(rnorm(0:3000,mean=75,sd=5))
+```
+
+Now here's a Poisson distribution with the same mean:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+qplot(rpois(0:3000,lambda=75)) + stat_bin(binwidth = 1)
+```
+
+Looks kind of similar doesn't it! The thing with the Poisson distribution is, when the mean ($\lambda$ - lambda) changes, so does the distribution. As the mean gets smaller (and this is often the case with flow data where small flows are very likely - have a look at the 'Total' column in your cdata dataframe, lots of small numbers aren't there?) the distribution starts to look a lot more like a skewed or log-normal distrbution. They key thing is it's not - it's a Poisson distribution. Here's a similar frequency distribution with a small mean:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#what about a lambda of 0.5?
+qplot(rpois(0:3000,0.5)) + stat_bin(binwidth = 1)
+```
+
+
+As far as we're concerned, what this means is that if we are interested in all flows between all origins and destinations in our system, these flows will have a mean value of $\lambda_{ij}$ and this will dictate the distribution. Here's what the distrbution of our flows looks like:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+qplot(mdata$Flow) + geom_histogram()
+```
+
+####Mmmm, Poissony!
+
+So, what does all of this mean for our spatial interaction model?
+
+Well the main thing it means is that Equation 5, for most sorts of spatial interaction models where we are modelling flows of people or whole things, is not correct. 
+
+By logging both sides of the equation in Equation 5, we are trying to get a situation where our $T_{ij}$ flows can be modelled by using the values of our other variables such as distance, by using a straight line a bit like this:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+qplot(log(dist), log(Flow), data=mdatasub) + geom_smooth(method = lm)
+```
+
+If you compare this graph with the graph above (the first scatter plot we drew in this practical exercise), it's exactly the same data, but clearly by logging both the total and distance, we can get a bit closer to being able to fit a model estimate using a straight line. 
+
+What the Poisson distribution means is that the $y$ variable in our model is not logged as in the graph above, but it can still be modelled using something like the blue line - I hope that sort of makes sense. If not, don't worry, just take it from me that this is good news. 
+
+###The Poisson Regression Spatial Interaction Model
+
+So, we can now re-specify Equation 5 as a Poisson Regression model. Instead of our independent variable being $\ln T_{ij}$ our dependent variable is now the mean of our Poisson distribution $\lambda_{ij}$ and the model becomes:
+
+(6)
+$$\lambda_{ij} = \exp(k + \mu\ln V_i + \alpha\ln W_j - \beta \ln d_{ij})$$
+
+What this model says is $\lambda_{ij}$ (our independent variable - the estimate of $T_{ij}$) is *logarithmically linked * to  (or modelled by) a linear combination of the logged independent variables in the model.
+
+Now we have Equation 6 at our disposal, we can use a Poisson regression model to produce estimates of $k$, $\mu$, $\alpha$ and $\beta$ - or put another way, we can use the regression model to calibrate our parameters. 
+
+So, let's have a go at doing it!!
+
+It's very straight forward to run a Poisson regression model in R using the `glm` (Generalised Linear Models) function. In practical terms, running a GLM model is no different to running a standard regression model using `lm`. If you want to find out more about glm, try the R help system `?glm` or google it to find the function details. If you delve far enough into the depths of what GLM does, you will find that the parameters are calibrated though an 'iteratively re-weighted least squares' algorithm. This algorithm does exaxtly the sort of job I described earlier, it fits lots of lines to the data, continually adjusting the parameters and then seeing if it can minimise the error between the observed and expected values useing some goodness-of-fit measure is maximised/minimised. 
+
+These sorts of algorithms have been around for years and are very well established so it makes sense to make use of them rather than trying to re-invent the wheel ourselves. So here we go...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run the unconstrained model
+uncosim <- glm(Flow ~ log(vi1_origpop)+log(wj3_destmedinc)+log(dist), na.action = na.exclude, family = poisson(link = "log"), data = mdatasub)
+```
+
+It's a simple as that - runs in a matter of milliseconds. You should be able to see how the `glm` R code corresponds to Equation 6. 
+
+`Total` = $T_{ij}$ = $\lambda_{ij}$ 
+
+`~` means 'is modelled by' 
+
+`log(vi1_origpop)` = $ln V_i$
+
+`log(wj2_destsal)` = $ln W_j$
+
+`log(dist)` = $\ln d_{ij}$
+
+`family = poisson(link = "log")` means that we are using a Poisson regression model (the link is always log with a Poisson model) where the left-hand side of the model equation is logarithmically linked to the variables on the right-hand side. 
+
+So what comes out of the other end?
+
+Well, we can use the `summary()` function to have a look at the model parameters:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run the unconstrained model
+summary(uncosim) 
+```
+
+We can see from the summary that the Poisson regression has calibrated all 4 parameters for us and these appear under the 'estimate' column:
+
+$k$ (intercept) = 7.1953790
+
+$\mu$ = 0.5903363
+
+$\alpha$ = -0.1671417
+
+and $\beta$ = -0.8119316
+
+
+We can also see from the other outputs that all variables are highly significant (***), with the z-scores revealing that distance has the most influence on the model (as we might have expected from the scatter plots we produced earlier which showed that distance had by far the strongest correlation with migration flows). 
+
+These parameters are not too far away from our initial guesses of $\mu$ = 1, $\alpha$ = 1 and $\beta$ = -2, but how do the estimates compare?
+
+One way to calculate the estimates is to plug all of the parameters back into Equation 6 like this:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#first asign the parameter values from the model to the appropriate variables
+k <- uncosim$coefficients[1]
+mu <- uncosim$coefficients[2]
+alpha <- uncosim$coefficients[3]
+beta <- -uncosim$coefficients[4]
+
+#now plug everything back into the Equation 6 model... (be careful with the positive and negative signing of the parameters as the beta parameter may not have been saved as negative so will need to force negative)
+mdatasub$unconstrainedEst2 <- exp(k+(mu*log(mdatasub$vi1_origpop))+(alpha*log(mdatasub$wj3_destmedinc))-(beta*log(mdatasub$dist)))
+
+#which is exactly the same as this...
+mdatasub$unconstrainedEst2 <- (exp(k)*exp(mu*log(mdatasub$vi1_origpop))*exp(alpha*log(mdatasub$wj3_destmedinc))*exp(-beta*log(mdatasub$dist)))
+
+#and of course, being R, there is an even easier way of doing this...
+mdatasub$fitted <- fitted(uncosim)
+```
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run the model and store all of the new flow estimates in a new column in the dataframe
+mdatasub$unconstrainedEst2 <- round(mdatasub$unconstrainedEst2,0)
+sum(mdatasub$unconstrainedEst2)
+#turn it into a little matrix and have a look at your handy work
+mdatasubmat2 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "unconstrainedEst2", margins=c("Orig_code", "Dest_code"))
+mdatasubmat2
+```
+
+And the $1,000,000 question - has calibrating the parameters improved the model...?
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRSquared(mdatasub$Flow,mdatasub$unconstrainedEst2)
+```
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRMSE(mdatasub$Flow,mdatasub$unconstrainedEst2)
+```
+
+###Yes indeedy do!!
+
+The $r^2$ has improved from 0.18 to 0.29 and the RMSE has reduced from 27535.2 to 11436.64 so by calibrating our parameters using the Poisson Regression Model, we have markedly improved our model fit. 
+
+But we can do even better. We have just been playing with the unconstrained model, by adding constraints into the model we can both improve our fit further AND start to do cool things like esimate transport trip distributions from know information about people leaving an area, or in different contexts estimate the amount of money a shop is going to make from the available money that people in the surrounding area have to spend, or guess the number of migrants travelling between specific countries where we only know how many people in total leave one country and arrive in another. 
+
+##Section 2 - Constrained Models
+
+If we return to [Alan Wilson's 1971 paper](http://journals.sagepub.com/doi/abs/10.1068/a030001), he introduces a full *family* of spatial interaction models of which the unconstrained model is just the start. And indeed since then, there have been all number of incremental advances and alternatives (such as [Stewart Fotheringham's Competing Destinations models](https://www.researchgate.net/publication/23537117_A_New_Set_of_Spatial-Interaction_Models_The_Theory_of_Competing_Destinations), [Pooler's production/attraction/cost relaxed models](http://journals.sagepub.com/doi/abs/10.1177/030913259401800102), [Stillwell's origin/destination parameter specific models](http://journals.sagepub.com/doi/pdf/10.1068/a101187) and [mine and Alan's own multi-level model](http://journals.sagepub.com/doi/pdf/10.1068/a45398) (to name just a few).
+
+In this section we will explore the rest of Wilson's family - the Production (origin) Constrained Model; the Attraction (destination) constrained model; and the Doubly Constrained Model. 
+
+We will see how we can, again, use a Poisson regression model in R to calibrate these models and how, once calibrated, we can use the models in different contexts, such as Land Use Transportation Interaction (LUTI) modelling, retail modelling and migration modelling. 
+
+##1. Production and Attraction Constrained Models
+
+
+Wilson's real contribution to the field was in noticing that the unconstrained gravity model was sub-optimal as it did not make use of all of the available data in the system we are studying. 
+
+If we recall the estimates from our unconstrained model, none of the estimates summed to the observed in and out-flow totals:
+
+```{r}
+mdatasubmat2
+```
+
+
+
+Our estimates did sum to the grand total of flows, but this is because we were really fitting a 'total constrained' model which used $k$ - our constant of proportionality - to ensure everything sort of added up (to within 1 commuter). 
+
+Where we have a full flow matrix to calibrate parameters, we can incorporate the row (origin) totals, column (destination) totals or both origina and destination totals to *constrain* our flow estimates to these known values. 
+
+As I outline in the accompanying paper, there are various reasons for wanting to do this, for example:
+
+a) If We are interested in flows of money into businesses or customers into shops, might have information on the amount of disposable income and shopping habits of the people living in different areas from loyalty card data. This is known information about our origins and so we could *constrain*  our spatial interaction model to this known information - we can make the assumption that this level of disposable income remains the same. We can then use other information about the attractiveness of places these people might like to shop in (store size, variety / specialism of goods etc.), to estimate how much money a new store opening in the area might make, or if a new out-of-town shopping centre opens, how much it might affect the business of shops in the town centre. This is what is known in the literature as the 'retail model' and is perhaps the most common example of a **Production (orign) Constrained Spatial Interaction Model**
+
+b) We might be interested in understanding the impact of a large new employer in an area on the flows of traffic in the vicinity or on the demand for new worker accommodation nearby. A good example of where this might be the case is with large new infrastructure developments like new airports. For example, before the go-ahead for the new third runway at Heathrow was given, one option being considered was a new runway in the Thames Estuary. If a new airport was built here, what would be the potential impact on transport flows in the area and where might workers commute from? This sort of scenario could be tested with an **Attraction (destination) Constrained Spatial Interaction Model** where the number of new jobs in a destination is known (as well as jobs in the surrounding area) and the model could be used to estimate where the workers will be drawn from (and their likely travel-to-work patterns). This model is exactly the sort of model Land Use Transport Interaction (LUTI) model that was constructed by the Mechanicity Team in CASA - details [here](http://www.mechanicity.info/research/land-use-transport-interaction-modelling/#transport) if you are interested...
+
+c) We might be interested in understanding the changing patterns of commuting or migration over time. Data from the Census allows us to know an accurate snap-shot of migrating and commuting patterns every 10 years. In these full data matrices, we know both the numbers of commuters/migrants leaving origins and arriving at destinations as well as the interactions between them. If we constrain our model estimates to this known information at origin and destination, we can examine various things, including:
+
+     i) the ways that the patterns of commuting/migration differ from the model predictions - where we might get more migrant/commuter flows than we would expect
+     ii) how the model parameters vary over time - for example how does distance / cost of travel affect flows over time? Are people prepared to travel further or less far than before?
+
+
+##2. Production-constrained Model
+
+(1) $$T_{ij} = A_i O_i W_j^\alpha d_{ij}^-\beta $$
+
+where
+
+(2) $$O_{i} = \sum_j T_{ij}$$
+
+and 
+
+(3) $$ A_i = \frac{1}{\sum_j W_j^\alpha d_{ij}^-\beta}$$
+
+In the production-constrained model, $O_i$ does not have a parameter as it is a known constraint. $A_i$ is known as a *balancing factor* and is a vector of values which relate to each origin, $i$, which do the equivalent job to $k$ in the unconstrained/total constrained model but ensure that flow estimates from each origin sum to the know totals, $O_i$ rather than just the overall total.
+
+Now at this point, we could calculate all of the $O_i$s and the $A_i$s by hand for our sample system and then set about guessing/estimating the parameter values for the rest of the model, but as you might have already suspected from last time, we can use R and `glm` to make it really easy and do all of that for us - woo hoo!
+
+We set about re-specifying the Production-Constrained model as a Poisson regression model in exactly the same way as we did before. We need to take logs of the right-hand side of equation and assume that these are logarithmially linked to the Poisson distributed mean ($\lambda_{ij}$) of the $T_{ij}$ variable. As such, Equation (1) becomes:
+
+(4) $$\lambda_{ij} = exp(\mu_{i} + \alpha \ln W_j - \beta \ln d_{ij})$$
+
+In Equation (4) $\mu_{i}$ is the equivalent of the vector of balancing factors $A_i$, but in regression / log-linear modelling terminology can also be described as either **dummy variables** or **fixed effects**. In practical terms, what this means is that in our regression model, $\mu_i$ is modelled as a [categorical predictor](https://en.wikipedia.org/wiki/Categorical_variable) and therefore in the Poisson regression model, we don't use the numeric values of $O_i$, we use a categorical identifier for the origin. In terms of the origin/destination migration matrix shown in Table 3, rather than the flow of 204,828 migrants leaving Sydney (row 1) being used as a predictor, simply the code ‘1GSYD’ is used as a dummy variable. 
+
+Before giving it a whirl, it's important to note in the code example below the use of '-1' after the distance variable (thanks to Hadrien Salat in CASA for bringing this to my attention). The -1 serves the purpose of removing the intercept that by default, GLM will insert into the model. As was mentioned earlier, the vector of origin parameters will replace the intercept in this model. It also serves the purpose
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run a production constrained SIM (the "-1" indicates no intercept in the regression model).
+prodSim <- glm(Flow ~ Orig_code+log(wj3_destmedinc)+log(dist)-1, na.action = na.exclude, family = poisson(link = "log"), data = mdatasub)
+#let's have a look at it's summary...
+summary(prodSim)
+```
+
+So, what do we have?
+
+Well, there are the elements of the model output that should be familiar from the unconstrained model:
+
+
+the $\alpha$ parameter related to the destination attractiveness: -0.272640
+
+the $\beta$ distance decay parameter: -1.227679
+
+We can see from the standard outputs from the model that all of the explanatory variables are statistically significant (***) and the z-scores indicate that the destination salary is having the most influence on the model, with distance following closely behind. 
+And then we have a series of parameters which are the vector of $\mu_i$ values associated with our origin constraints.
+
+###2.1 Model Estimates
+
+Now at this point you will be wanting to know what affect the constraints have had on the estimates produced by the model, so let's plug the parameters back into Equation 4 and take a look...
+
+Create some $O_i$ and $D_j$ columns and store the total in and out flow matrix margins in them. *Note, in the syntax below, I use the forward-pipe or %>% operator. This is probably something a bit new and warrents a bit of explaining. If you'd like to know more about how pipes can be used in R, visit the [magrittr vignette page here](https://cran.r-project.org/web/packages/magrittr/vignettes/magrittr.html) - for now, just think of %>% as a bit like saying "then..." in your code*
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#create some Oi and Dj columns in the dataframe and store row and column totals in them:
+#to create O_i, take mdatasub ...then... group by origcodenew ...then... summarise by calculating the sum of Total
+O_i <- mdatasub %>% group_by(Orig_code) %>% summarise(O_i = sum(Flow))
+mdatasub$O_i <- O_i$O_i[match(mdatasub$Orig_code,O_i$Orig_code)]
+D_j <- mdatasub %>% group_by(Dest_code) %>% summarise(D_j = sum(Flow))
+mdatasub$D_j <- D_j$D_j[match(mdatasub$Dest_code,D_j$Dest_code)]
+```
+
+Now fish the coefficients out of the prodsim glm object 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#You can do this in a number of ways, for example this prints everything:
+prodSim_out <- tidy(prodSim)
+prodSim_out
+```
+
+Or, more usefully, pull out the parameter values for $\mu_i$ and store them back in the dataframe along with $O_i$ and $D_j$
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# or you can just pull out the coefficients and put them into an object
+coefs <- as.data.frame(prodSim$coefficients)
+#then once you have done this, you can join them back into the dataframe using a regular expression to match the bits of the identifier that you need - *note, this bit of code below took me about 2 hours to figure out!*
+mdatasub$mu_i <- coefs$`prodSim$coefficients`[match(mdatasub$Orig_code,sub(".*Orig_code","", rownames(coefs)))]
+#now, where we have missing values for our reference mu_i variable, fill those with 1s
+head(mdatasub)
+```
+
+OK, now we can save our parameter values into some variables...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#the numbers in the brackets refer to positions in the coefficient vector. Here, positions 1:15 relate to the mu_i values and 16 & 17 for alpha and beta. For different numbers of zones and other variables, these references will have to change. 
+mu_i <- prodSim$coefficients[1:15]
+alpha <- prodSim$coefficients[16]
+beta <- prodSim$coefficients[17]
+```
+
+And we're ready to generate our estimates:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+mdatasub$prodsimest1 <- exp((mdatasub$mu_i)+(alpha*log(mdatasub$wj3_destmedinc))+(beta*log(mdatasub$dist)))
+```
+
+Now of course we could also have done this the easy way, but again, I think it helps doing it the hard way, especially if we want to play with the parameters by hand or adjust any of the input values when running some what-if scenarios. 
+
+Here's the easy way again for those who can't remember:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+mdatasub$prodsimFitted <- fitted(prodSim)
+
+head(mdatasub)
+```
+
+###2.2 Assessing the model output
+
+So what do the outputs from our Production Constrained Model look like? How has the goodness-of-fit improved and how can we start to use this a bit like a retail model and assess the likely impacts of changing destination attractiveness etc.?
+
+####2.2.1 The flow matrix
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#first round the estimates
+mdatasub$prodsimFitted <- round(fitted(prodSim),0)
+#now we can create pivot table to turn paired list into matrix (and compute the margins as well)
+mdatasubmat3 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "prodsimFitted", margins=c("Orig_code", "Dest_code"))
+mdatasubmat3
+```
+
+And compared with the original observed data?
+
+```{r}
+mdatasubmat
+```
+
+Here it is very easy to see the Origin Constraints working. The sum across all destinations for each origin in the estimated matrix is exactly the same as the same sum across the observed matrix - $\sum_j T_{ij} = \sum_j \lambda_{ij} = O_i$, but clearly, the same is not true when you sum across all origins for each destination - $\sum_i T_{ij} \neq \sum_i \lambda_{ij} \neq D_j$
+
+####2.2.2 How do the fits compare with the unconstrained model from last time?
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#use the functions from the last practical to calculate some goodness-of-fit statistics
+CalcRSquared(mdatasub$Flow,mdatasub$prodsimFitted)
+```
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRMSE(mdatasub$Flow,mdatasub$prodsimFitted)
+```
+
+Clearly by constraining our model estimates to known origin totals, the fit of the model has improved quite considerably - from around 0.67 in the unconstrained model to around 0.82 in this model. The RMSE has also dropped quite noticably. 
+
+####2.2.3 A 'what if...' scenario
+
+Now that we have calibrated our parameters and produced some estimates, we can start to play around with some what-if scenarios.
+
+For example - What if the government invested lots of money in Tasmainia and average weekly salaries increased from 540.45 to 800.50 dollars a week? A far fetched scenario, but one that could make a good experiment. 
+
+First create create a new variable with these altered salaries:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+mdatasub$wj3_destmedincScenario <- mdatasub$wj3_destmedinc
+mdatasub$wj3_destmedincScenario <- ifelse(mdatasub$wj3_destmedincScenario == 540.45,800.50,mdatasub$wj3_destmedincScenario)
+```
+
+Now let's plug these new values into the model and see how this changes the flows in the system...
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+mdatasub$prodsimest2 <- exp((mdatasub$mu_i)+(alpha*log(mdatasub$wj3_destmedincScenario))+(beta*log(mdatasub$dist)))
+
+mdatasub$prodsimest2 <- round(mdatasub$prodsimest2,0)
+#now we can create pivot table to turn paired list into matrix (and compute the margins as well)
+mdatasubmat4 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "prodsimest2", margins=c("Orig_code", "Dest_code"))
+mdatasubmat4
+```
+
+You will notice that by increasing the average salary in the rest of Tazmania, we've reduced the flows into this area (yes, I know, counterintuitively, but this is just an example), but have not reduced the flows into other zones - the original constraints are still working on the other zones. One way to get around this, now that we have calibrated our parameters, is to return to the multiplicative model in Equation 1 and run this model after calculating our own $A_i$ balancing factors. 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#calculate some new wj^alpha and dij^beta values
+wj2_alpha <- mdatasub$wj3_destmedinc^alpha
+dist_beta <- mdatasub$dist^beta
+#calculate the first stage of the Ai values
+mdatasub$Ai1 <- wj2_alpha*dist_beta
+#now do the sum over all js bit
+A_i <- mdatasub %>% group_by(Orig_code) %>% summarise(A_i = sum(Ai1))
+#now divide in to 1
+A_i[,2] <- 1/A_i[,2]
+#and write the A_i values back into the data frame
+mdatasub$A_i <- A_i$A_i[match(mdatasub$Orig_code,A_i$Orig_code)]
+```
+
+So that is it for calculating your $A_i$ values. Now you have these, it's very simple to plug everything back into Equation 1 and generate some estimates...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#To check everything works, recreate the original estimates
+mdatasub$prodsimest3 <- mdatasub$A_i*mdatasub$O_i*wj2_alpha*dist_beta
+```
+
+You should see that your new estimates are exactly the same as your first estimates. If they're not, then something has gone wrong. Now we have this though, we can keep messing around with some new estimates and keep the constraints. 
+Remember, though, that you will need to recalculate $A_i$ each time you want to create a new set of estimates. Let's try with our new values for the destination salary in the rest of Tazmania:
+
+```{r}
+#calculate some new wj^alpha and dij^beta values
+wj3_alpha <- mdatasub$wj3_destmedincScenario^alpha
+#calculate the first stage of the Ai values
+mdatasub$Ai1 <- wj3_alpha*dist_beta
+#now do the sum over all js bit
+A_i <- mdatasub %>% group_by(Orig_code) %>% summarise(A_i = sum(Ai1))
+#now divide in to 1
+A_i[,2] <- 1/A_i[,2]
+#and write the A_i values back into the data frame
+mdatasub$A_i <- A_i$A_i[match(mdatasub$Orig_code,A_i$Orig_code)]
+```
+
+Now we have some new $A_i$s, let's generate some new scenario flow estimates...
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#To check everything works, recreate the original estimates
+mdatasub$prodsimest4_scenario <- mdatasub$A_i*mdatasub$O_i*wj3_alpha*dist_beta
+```
+
+```{r}
+mdatasub$prodsimest4_scenario <- round(mdatasub$prodsimest4_scenario,0)
+#now we can create pivot table to turn paired list into matrix (and compute the margins as well)
+mdatasubmat5 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "prodsimest4_scenario", margins=c("Orig_code", "Dest_code"))
+mdatasubmat5
+```
+
+
+There are a number of things to note here. Firstly, flows into Tazmania have reduced, while flows into other regions have increased. 
+
+Secondly, yes, I know this was a bad example, but try with some of the other variables for yourself. 
+
+Thirdly, Our origin constraints are now holding again. 
+
+##3. Attraction-Constrained Model
+
+The attraction constrained Model is virtually the same as the Production constrained model:
+
+(5) $$T_{ij} = D_j B_j V_i^\mu d_{ij}^-\beta $$
+
+where
+
+(6) $$D_{j} = \sum_i T_{ij}$$
+
+and 
+
+(7) $$ B_j = \frac{1}{\sum_i V_i^\mu d_{ij}^-\beta}$$
+
+
+I won't dwell on the attraction constrained model, except to say that it can be run in R as you would expect:
+
+(8) $$\lambda_{ij} = exp(\mu \ln V_i + \alpha_{i} - \beta \ln d_{ij})$$
+
+or in R:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+attrSim <- glm(Flow ~ Dest_code+log(vi1_origpop)+log(dist)-1, na.action = na.exclude, family = poisson(link = "log"), data = mdatasub)
+summary(attrSim)
+```
+
+we can examine how the constraints hold for destinations this time:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#first round the estimates
+mdatasub$attrsimFitted <- round(fitted(attrSim),0)
+#now we can create pivot table to turn paired list into matrix (and compute the margins as well)
+mdatasubmat6 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "attrsimFitted", margins=c("Orig_code", "Dest_code"))
+mdatasubmat6
+```
+
+compared to...
+
+```{r}
+mdatasubmat
+```
+
+
+and we can test the goodness-of-fit in exactly the same way as before:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#use the functions from the last practical to calculate some goodness-of-fit statistics
+CalcRSquared(mdatasub$Flow,mdatasub$attrsimFitted)
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRMSE(mdatasub$Flow,mdatasub$attrsimFitted)
+
+```
+
+OK, that's where I'll leave singly constrained models for now. There are, of course, plenty of things you could try out. For example:
+
+1. You could try mapping the coefficients or the residual values from the model to see if there is any patterning in either the over or under prediction of flows.
+
+2. You could try running your own version of a LUTI model by first calibrating the model parameters and plugging these into a multiplicative version of the model, adjusting the destination constraints to see which origins are likely to generate more trips.
+
+##4. Doubly Constrained Model
+
+Now, the model in the family you have all been waiting for - the big boss, the daddy, the **doubly constrained model!**
+
+Let's begin with the formula:
+
+(9) $$T_{ij} = A_i O_i B_j D_j d_{ij}^-\beta $$
+
+where
+
+(10) $$O_{i} = \sum_j T_{ij}$$
+
+(11) $$D_{j} = \sum_i T_{ij}$$
+
+and 
+
+(12) $$A_i = \frac{1}{\sum_j B_j D_j d_{ij}^-\beta}$$
+
+(13) $$B_j = \frac{1}{\sum_i A_i O_i d_{ij}^-\beta}$$
+
+
+Now, the astute will have noticed that the calculation of $A_i$ relies on knowing $B_j$ and the calculation of $B_j$ relies on knowing $A_i$. A conundrum!! If I don't know $A_i$ how can I calcuate $B_j$ and then in turn $A_i$ and then $B_j$ *ad infinitum*???!!
+
+Well, I wrestled with that for a while until I came across [this paper by Martyn Senior](http://journals.sagepub.com/doi/abs/10.1177/030913257900300218) where he sketches out a very useful algorithm for iteratively arriving at values for $A_i$ and $B_j$ by setting each to equal 1 initially and then continuing to calculate each in turn until the difference between each value is small enough not to matter. 
+
+We will return to this later, but for now, we will once again use the awesome power of R to deal with all of this difficulty for us!
+
+We can run the doubly constrained model in exactly the same way as we ran the singly constrained models:
+
+(14) $$\lambda_{ij} = exp(\mu_i + \alpha_{i} - \beta \ln d_{ij})$$
+
+The code below has changed a litte from the singly constrained models I have removed the '-1' which means that an intercept will appear in the model again. This is not because I want an intercept as it makes the origin and destination coefficients harder to interpret - reference categories zones will appear and the coefficients will need to be compared with the intercept - rather the '-1' cheat for removing the intercept only works with one factor level - here we have two (origins and destinations). For full details and an explanation for alternative ways for dealing with this, please visit here - https://stats.stackexchange.com/questions/215779/removing-intercept-from-glm-for-multiple-factorial-predictors-only-works-for-fir - for ease, here we will just continue with the intercept. 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run a production constrained SIM
+doubSim <- glm(Flow ~ Orig_code+Dest_code+log(dist), na.action = na.exclude, family = poisson(link = "log"), data = mdatasub)
+#let's have a look at it's summary...
+summary(doubSim)
+```
+
+And the various flows and goodness-of-fit statistics?
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#then round the estimates
+mdatasub$doubsimFitted <- round(fitted(doubSim),0)
+#now we can create pivot table to turn paired list into matrix (and compute the margins as well)
+mdatasubmat7 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "doubsimFitted", margins=c("Orig_code", "Dest_code"))
+mdatasubmat7
+```
+
+compared to...
+
+```{r}
+mdatasubmat
+```
+
+
+and we can test the goodness-of-fit in exactly the same way as before:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#use the functions from the last practical to calculate some goodness-of-fit statistics
+CalcRSquared(mdatasub$Flow,mdatasub$doubsimFitted)
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRMSE(mdatasub$Flow,mdatasub$doubsimFitted)
+```
+
+So the goodness of fit has shot up and we can clearly see the origin and destination constraints working, and for most sets of flows, the model is now producing some good estimates. However, there are still some errors in the flows. 
+
+Is there anything more we can do? Yes, of course there is. 
+
+###4.1 Tweaking our Models
+
+####4.1.1 Distance Decay
+
+Now, all of the way through these practicals, we have assumed that the distance decay parameter follows a negative power law. Well, it doesn't need to. 
+
+In [Wilson's original paper](http://journals.sagepub.com/doi/abs/10.1068/a030001), he generalised the distance decay parameter to: 
+
+$$f(d_{ij})$$ 
+
+Where $f$ represents some function of distance describing the rate at which the flow interactions change as distance increases. Lots of people have written about this, including [Tayor (1971)](http://onlinelibrary.wiley.com/doi/10.1111/j.1538-4632.1971.tb00364.x/full) and more recently Robin Lovelace in a transport context, [here](https://www.slideshare.net/ITSLeeds/estimating-distance-decay-for-the-national-propensity-to-cycle-tool).
+
+For the inverse power law that we have been using is one possible function of distance, the other common one that is used is the negative exponential function:
+
+$$exp(-\beta d_{ij})$$
+
+We can get a feel for how different distance decay parameters work by plotting some sample data (try different parameters):
+
+```{r}
+xdistance <- seq(1,20,by=1)
+InvPower2 <- xdistance^-2
+NegExp0.3 <- exp(-0.3*xdistance)
+
+df <- cbind(InvPower2,NegExp0.3)
+meltdf <- melt(df)
+ggplot(meltdf,aes(Var1,value, colour = Var2)) + geom_line()
+
+```
+
+
+There is no hard and fast rule as to which function to pick, it will just come down to which fits the data better...
+
+As [Tayor Oshan points out in his excellent Primer](http://openjournals.wu.ac.at/region/paper_175/175.html) what this means in our Poisson regression model is that we simply substitute $-\beta \ln d_{ij}$ for $-\beta d_{ij}$ in our model:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#run a production constrained SIM
+doubSim1 <- glm(Flow ~ Orig_code+Dest_code+dist, na.action = na.exclude, family = poisson(link = "log"), data = mdatasub)
+#let's have a look at it's summary...
+summary(doubSim1)
+```
+
+```{r}
+mdatasub$doubsimFitted1 <- round(fitted(doubSim1),0)
+```
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+CalcRSquared(mdatasub$Flow,mdatasub$doubsimFitted1)
+CalcRMSE(mdatasub$Total,mdatasub$doubsimFitted1)
+```
+
+So, it would appear that in this case using a negative exponential function in our model results in a worse outcome than the initial inverse power law - this may not always be the case, so it is worth experimenting. 
+
+####4.1.2 Adding more explanatory variables
+
+Yes, the nice thing about doing all of this in a regression modelling framework is we can just keep adding predictor variables into the mix and seeing whether they have an effect. 
+
+You can't add origin or destination specific predictors into a doubly constrained model like this, however, switching back to the singly constrained models, as many different origin or destination predictor variables can be added as seems reasonable (subject to the usual restrictions on high correlation)
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+kitchensinkSIM <- glm(Flow ~ Dest_code + vi1_origpop + vi2_origunemp + vi3_origmedinc + vi4_origpctrent -1, na.action = na.exclude, family = poisson(link = "log"), data = mdatasub)
+#let's have a look at it's summary...
+summary(kitchensinkSIM)
+```
+
+
+###4.2 From Poisson Regression back to Entropy
+
+As with the earlier models, I have shown you how you can plug the parameter estimates back into Wilson's entropy maximising multiplicative models in order to generate estimates and tweak things still further. 
+
+If you remember from Equations 11 and 12 above, the key to the doubly constrained models is the $A_i$ and $B_j$ balancing factors and as they rely on each other, they need to be calculated iteratively. We can do this using [Senior's algorthm ](http://journals.sagepub.com/doi/abs/10.1177/030913257900300218) also mentioned earlier. 
+
+Here is the algorithm in R... (I wrote this code way back in 2012, so it's a bit ropey, but it works...) To run it, hightlight the whole thing and run it all at once. 
+
+After it works, you can spend some time working out what is going on. I find the best solution is to try and run elements of the code individually to see what is happening...
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+##########################################################################
+#This block of code will calculate balancing factors for an entropy
+#maximising model (doubly constrained)
+
+#set beta to the appropriate value according to whether exponential or power
+if(tail(names(coef(doubSim)),1)=="dist"){
+  mdatasub$beta <- coef(doubSim)["dist"]
+  disdecay = 0
+} else {
+  mdatasub$beta <- coef(doubSim)["log(dist)"]
+  disdecay = 1
+}
+
+#Create some new Ai and Bj columns and fill them with starting values
+mdatasub$Ai <- 1
+mdatasub$Bj <- 1
+mdatasub$OldAi <- 10
+mdatasub$OldBj <- 10
+mdatasub$diff <- abs((mdatasub$OldAi-mdatasub$Ai)/mdatasub$OldAi)
+
+#create convergence and iteration variables and give them initial values
+cnvg = 1
+its = 0
+
+#This is a while-loop which will calculate Orig and Dest balancing
+#factors until the specified convergence criteria is met
+while(cnvg > 0.001){
+  print(paste0("iteration ", its))
+  its = its + 1 #increment the iteration counter by 1
+  #First some initial calculations for Ai...
+  if(disdecay==0){
+    mdatasub$Ai <- (mdatasub$Bj*mdatasub$D_j*exp(mdatasub$dist*mdatasub$beta))
+  } else {
+    mdatasub$Ai <- (mdatasub$Bj*mdatasub$D_j*exp(log(mdatasub$dist)*mdatasub$beta))
+  }  
+  #aggregate the results by your Origs and store in a new dataframe
+  AiBF <- aggregate(Ai ~ Orig_code, data = mdatasub, sum)
+  #now divide by 1
+  AiBF$Ai <- 1/AiBF$Ai 
+  #and replace the initial values with the new balancing factors
+  updates = AiBF[match(mdatasub$Orig_code,AiBF$Orig_code),"Ai"]
+  mdatasub$Ai = ifelse(!is.na(updates), updates, mdatasub$Ai)
+  #now, if not the first iteration, calculate the difference between  the new Ai values and the old Ai values and once done, overwrite the old Ai values with the new ones. 
+  if(its==1){
+    mdatasub$OldAi <- mdatasub$Ai    
+  } else {
+    mdatasub$diff <- abs((mdatasub$OldAi-mdatasub$Ai)/mdatasub$OldAi)    
+    mdatasub$OldAi <- mdatasub$Ai
+  }
+  
+  #Now some similar calculations for Bj...
+  if(disdecay==0){
+    mdatasub$Bj <- (mdatasub$Ai*mdatasub$O_i*exp(mdatasub$dist*mdatasub$beta))
+  } else {
+    mdatasub$Bj <- (mdatasub$Ai*mdatasub$O_i*exp(log(mdatasub$dist)*mdatasub$beta))
+  }
+  #aggregate the results by your Dests and store in a new dataframe
+  BjBF <- aggregate(Bj ~ Dest_code, data = mdatasub, sum)
+  #now divide by 1
+  BjBF$Bj <- 1/BjBF$Bj  
+  #and replace the initial values by the balancing factor
+  updates = BjBF[match(mdatasub$Dest_code,BjBF$Dest_code),"Bj"]
+  mdatasub$Bj = ifelse(!is.na(updates), updates, mdatasub$Bj)
+#now, if not the first iteration, calculate the difference between the new Bj values and the old Bj values and once done, overwrite the old Bj values with the new ones.
+  if(its==1){
+    mdatasub$OldBj <- mdatasub$Bj
+  } else {
+    mdatasub$diff <- abs((mdatasub$OldBj-mdatasub$Bj)/mdatasub$OldBj)    
+    mdatasub$OldBj <- mdatasub$Bj
+  } 
+  #overwrite the convergence variable with 
+  cnvg = sum(mdatasub$diff)
+}
+```
+
+So, we've calculated our $A_i$ and $B_j$ values using out iterative routine - now we can plug them back into our model, to prove, once again, that the Poisson Model is exactly the same as the multiplicative Entropy Maximising Model...
+
+```{r}
+########################################################################
+#Now create some SIM estimates
+if(disdecay==0){
+  mdatasub$SIM_Estimates <- (mdatasub$O_i*mdatasub$Ai*mdatasub$D_j*mdatasub$Bj*exp(mdatasub$dist*mdatasub$beta))
+} else{
+  mdatasub$SIM_Estimates_pow <- (mdatasub$O_i*mdatasub$Ai*mdatasub$D_j*mdatasub$Bj*exp(log(mdatasub$dist)*mdatasub$beta))
+}
+########################################################################
+```
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+mdatasub$SIM_Estimates_pow <- round(mdatasub$SIM_Estimates_pow,0)
+mdatasubmat8 <- dcast(mdatasub, Orig_code ~ Dest_code, sum, value.var = "SIM_Estimates_pow", margins=c("Orig_code", "Dest_code"))
+mdatasubmat8
+```
+
+Are the the same? Yes!! Woo hoo.
+
+##5. Conclusions, further notes and ideas for additional activities
+
+Hopefully you have now seen how it is extremely straight-forward to run and calibrate Wilson's full family of Spatial Interaction Models in R using GLM and Poisson Regression. 
+
+###5.1 Some Further Notes
+
+Now might be the time to mention that despite everything I've shown you, there has been some discussion in the literature as to whether the Poisson Model is actually a misspecification, especially for modelling migration flows. If you have the stomach for it, [this paper by Congdon goes into a lot of detail](http://journals.sagepub.com/doi/abs/10.1068/a251481).
+
+The issue is a thing called 'overdispersion' which, translated, essentially relates to the model not being able to capture all of the things that could be explaining the flows in the independent variables that are supplied to the model. The details are tedious and only really intelligible to those with a statistics background. If you want a starter, [try here](https://en.wikipedia.org/wiki/Overdispersion), but in practical terms, we can get around this problem by fitting a very similar sort of regression model called the *negative binomial* regression model. 
+
+If you wish, you can read up and experiment with this model - you can fit it in exactly the same way as the `glm` model but using a function called `glm.nb` which is part of the `mass` package. The negative binomial model has an extra parameter in the model for overdispersion. You you do try this, you will almost certainly discover that your results barely change - but hell, you might keep a pedantic reviewer at bay if you submit this to a journal (not that I'm speaking from experience or anything). 
+
+###And some more comments
+
+Another thing to note is that the example we used here had quite neat data. You will almost certainly run into problems if you have sparse data or predictors with 0s in them. If this happens, then you might need to either drop some rows in your data (if populated with 0s) or substitute 0s for very small numbers, much less than 1, but greater than 0 (this is because you can't take the log of 0)
+
+And another thing to note is that the models in this Australian example assumed that the flow data and predictors were all in and around the same order or magnitude. This is not necessarily the case, particularly with a 5 year migration transition and some large metropolitan areas. Where data that (such as population masses at origins and destinations) that are an order of magnitude different (i.e. populations about ten times larger in different locations) then the model estimates might be biased. Fortunately, there are packages available to help us with these problems as well. The [`robustbase` package](https://cran.r-project.org/web/packages/robustbase/index.html) features a function called `glmrob` which will deal with this issues (again, your results probably won't change much, but worth knowing).
+
