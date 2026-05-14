@@ -1,7 +1,13 @@
 ---
-title: "SIModelling"
-description: "Various bits of code to run Spatial Interaction Models in R"
-site:
-image:      # relative path in the repo, or a full URL
-type:
+title: "Spatial Interaction Modelling in R"
+description: "Code, notes and worked examples for fitting spatial interaction models in R — including a full walk-through originally developed for Australian Population Studies."
+site: SIMAus.html
+type: project
 ---
+
+# SIModelling
+
+Various bits of code to run Spatial Interaction Models in R.
+
+The walk-through is published at:
+<https://adamdennett.github.io/SIModelling/SIMAus.html>
