@@ -1,0 +1,11 @@
+# Metadata applied at render time (via `quarto render --metadata-file
+# _blog-format.yml`) so only blog*.qmd posts get the styling — other
+# qmds in the same project (e.g. main analysis files) are unaffected.
+
+format:
+  html:
+    css: _blog-style.css
+    toc: true
+    toc-depth: 3
+    smooth-scroll: true
+    code-link: true
