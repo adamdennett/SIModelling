@@ -1,0 +1,97 @@
+name: Render blog posts
+
+# ---------------------------------------------------------------------------
+# Universal template: auto-renders any blog*.qmd at the repo root and
+# commits the resulting HTML so GitHub Pages serves it. Works for repos
+# where Pages serves from `/docs` AND for repos where Pages serves from
+# the repo root — Quarto puts the output wherever the repo's _quarto.yml
+# tells it to, and this workflow stages whatever it finds.
+#
+# Drop into any repo as `.github/workflows/render-blogs.yml`. The blog
+# post itself goes at the repo root as blog1.qmd (or blog2.qmd, etc.).
+# adamdennett.co.uk's Blog page then discovers the rendered output on
+# its next render.
+#
+# Prerequisites (see templates/README.md for the full checklist):
+# - Repo has Pages enabled, build_type=legacy.
+# - _blog-style.css and _blog-format.yml at the repo root.
+# - .nojekyll at the Pages-served root (docs/.nojekyll if Pages serves
+#   from /docs; .nojekyll if Pages serves from root).
+# - .gitignore does NOT exclude the Pages-served directory.
+#
+# If a blog post uses R code chunks, uncomment the `setup-r` /
+# `setup-r-dependencies` steps below.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    paths:
+      - 'blog*.qmd'
+      - '_blog-style.css'
+      - '_blog-format.yml'
+      - '.github/workflows/render-blogs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: quarto-dev/quarto-actions/setup@v2
+
+      # Uncomment if any blog post uses R code chunks.
+      #
+      # - uses: r-lib/actions/setup-r@v2
+      #   with:
+      #     r-version: '4.5.2'
+      #     use-public-rspm: true
+      #
+      # - uses: r-lib/actions/setup-r-dependencies@v2
+      #   with:
+      #     packages: |
+      #       any::tidyverse
+      #       any::knitr
+      #       any::rmarkdown
+
+      - name: Render every blog*.qmd
+        run: |
+          shopt -s nullglob
+          for f in blog*.qmd; do
+            echo "::group::Rendering $f"
+            # --metadata-file layers the site styling on top of the qmd's
+            # own front-matter — only blog posts pick it up, other qmds
+            # in the project are unaffected.
+            quarto render "$f" --metadata-file _blog-format.yml
+            echo "::endgroup::"
+          done
+
+      - name: Commit rendered HTML + style assets
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage blog*.html, any blog*_files dir Quarto created, and the
+          # _blog-style.css copy Quarto placed next to the output.
+          # Search up to 3 levels deep so it works for both Pages-from-
+          # root and Pages-from-docs setups, while excluding well-known
+          # generated / VCS directories.
+          find . -maxdepth 3 \
+            \( -name 'blog*.html' -o -name 'blog*_files' -o -name '_blog-style.css' \) \
+            -not -path './.git/*' \
+            -not -path './.github/*' \
+            -not -path './_site/*' \
+            -not -path './_freeze/*' \
+            -not -path './node_modules/*' \
+            -print 2>/dev/null | while read f; do
+            git add "$f"
+          done
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-render blog posts [skip ci]"
+            git push
+          else
+            echo "Nothing staged — nothing to commit."
+          fi
